@@ -1,0 +1,722 @@
+From 150369ae897cda2ed8f1dd994e930724bfd732a6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 3 Nov 2026 19:13:39 +0000
+Subject: [PATCH] #483 step 8b: the loader's workflows prefer the bundle's
+ aisdlc gate commands
+
+Each bundle script or native tool call now runs the verified bundle's
+bin/<os>-<arch>/aisdlc gate <name> with the same arguments. One probe per
+bundle (the exact `aisdlc gate` usage line) picks it; an older bundle keeps
+the original path until step 8c.
+
+Written-by: codex
+---
+ .github/workflows/bot-review.yml        |  29 +++-
+ .github/workflows/checks.yml            |  64 ++++++--
+ .github/workflows/nightly-gates.yml     |  41 ++++-
+ .github/workflows/security.yml          |  25 ++-
+ README.md                               |  12 +-
+ docs/plans/483-loader-step-8b-report.md |  49 ++++++
+ tests/test_bundle_gate.py               | 195 ++++++++++++++++++++++++
+ tests/test_checks_workflow.py           |  35 +++--
+ 8 files changed, 410 insertions(+), 40 deletions(-)
+ create mode 100644 docs/plans/483-loader-step-8b-report.md
+ create mode 100644 tests/test_bundle_gate.py
+
+diff --git a/.github/workflows/bot-review.yml b/.github/workflows/bot-review.yml
+index ed8d312..324bfe0 100644
+--- a/.github/workflows/bot-review.yml
++++ b/.github/workflows/bot-review.yml
+@@ -2,8 +2,8 @@
+ #
+ # Reusable workflow. A repo calls it from `.github/workflows/ai-sdlc-bot-review.yml` on main, on
+ # schedule or workflow_dispatch, with the read permissions below and `id-token: write`.
+-# bot_review.sh, review_on_head.sh and head_checks.sh come from the signed gate bundle, never from
+-# the caller or a PR. For each open PR by an allowed author it submits APPROVE, REQUEST_CHANGES or a
++# The bot-review gate comes from the signed gate bundle, with bot_review.sh as the fallback
++# until step 8c, never from the caller or a PR. For each open PR by an allowed author it submits APPROVE, REQUEST_CHANGES or a
+ # COMMENT on the PR head from the AI-SDLC merge gate; it never merges (auto_merge.sh does).
+ #
+ # Tokens: the job's own read-only github.token reads PRs, reviews, comments, checks, statuses and
+@@ -32,6 +32,26 @@ concurrency:
+   group: ai-sdlc-bot-review-${{ github.repository }}
+   cancel-in-progress: false
+ 
++# One selector shared by the gate steps; all paths are in the verified bundle.
++env:
++  BUNDLE_GATE_SELECTOR: |
++    # until step 8c: older signed bundles still need their original entry points.
++    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
++    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
++    aisdlc=$gates/bin/$os-$arch/aisdlc
++    if [ ! -x "$aisdlc" ] ||
++       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
++      aisdlc=
++    fi
++    select_gate() {
++      if [ -n "$aisdlc" ]; then
++        gate=( "$aisdlc" gate "$1" )
++      else
++        shift
++        gate=( "$@" )
++      fi
++    }
++
+ jobs:
+   review:
+     name: The App reviews every open PR on its head
+@@ -74,4 +94,7 @@ jobs:
+           REVIEW_TOKEN=$(cat "$RUNNER_TEMP/app-token"); rm -f "$RUNNER_TEMP/app-token"
+           echo "::add-mask::$REVIEW_TOKEN"
+           export REVIEW_TOKEN
+-          sh "$RUNNER_TEMP/ai-sdlc-gates/scripts/bot_review.sh" --repo "$GITHUB_REPOSITORY"
++          gates=$RUNNER_TEMP/ai-sdlc-gates
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate bot-review sh "$gates/scripts/bot_review.sh"
++          "${gate[@]}" --repo "$GITHUB_REPOSITORY"
+diff --git a/.github/workflows/checks.yml b/.github/workflows/checks.yml
+index f64a6bf..01cbfb7 100644
+--- a/.github/workflows/checks.yml
++++ b/.github/workflows/checks.yml
+@@ -11,10 +11,10 @@
+ # verifies the newest unexpired signed record and the archive with the pinned verifier, and keeps
+ # the pair as a run artifact. review-on-head, owner-decisions, locked-tests and secret-scan
+ # download it, verify it again (load_gates.sh: same loader commit, signature, expiry, route,
+-# digest, MANIFEST.sha256), unpack it into $RUNNER_TEMP and run their scripts from it (slices 1
+-# and 2). The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries
+-# for the runner's OS and architecture (slice 3), so runners build nothing. No gate reads the
+-# caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
++# digest, MANIFEST.sha256), unpack it into $RUNNER_TEMP and run their gates from it (slices 1
++# and 2). All gates prefer the archive's bin/<os>-<arch>/aisdlc gate commands, with
++# the original scripts and native tools as fallbacks until step 8c. Runners build nothing.
++# No gate reads the caller's `.ai-sdlc/`, and none falls back to another copy. Each job reads the PR as data and
+ # never runs PR code.
+ #
+ # Runner (#731 section 7): GitHub-hosted only for a public repo, else [self-hosted, small]: every job
+@@ -55,6 +55,26 @@ permissions:
+ # keeps refs/remotes/pr/head from the last PR it checked, and a plain fetch refuses that
+ # non-fast-forward update, exits 1 and, with -q, prints nothing.
+ 
++# One selector shared by the gate steps; all paths are in the verified bundle.
++env:
++  BUNDLE_GATE_SELECTOR: |
++    # until step 8c: older signed bundles still need their original entry points.
++    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
++    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
++    aisdlc=$gates/bin/$os-$arch/aisdlc
++    if [ ! -x "$aisdlc" ] ||
++       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
++      aisdlc=
++    fi
++    select_gate() {
++      if [ -n "$aisdlc" ]; then
++        gate=( "$aisdlc" gate "$1" )
++      else
++        shift
++        gate=( "$@" )
++      fi
++    }
++
+ jobs:
+   resolve:
+     name: Resolve the PR and its head
+@@ -217,7 +237,9 @@ jobs:
+               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+           }
+           if load_gates; then
+-            if sh "$gates/scripts/review_on_head.sh" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
++            eval "$BUNDLE_GATE_SELECTOR"
++            select_gate review-on-head sh "$gates/scripts/review_on_head.sh"
++            if "${gate[@]}" "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY" > result.txt 2>&1; then code=0; else code=$?; fi
+             cat result.txt
+             line=$(head -1 result.txt | cut -c1-140)
+           else
+@@ -274,7 +296,9 @@ jobs:
+               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+           }
+           load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
+-          sh "$gates/scripts/owner_decisions_check.sh" "origin/$BASE" pr/head
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate owner-decisions sh "$gates/scripts/owner_decisions_check.sh"
++          "${gate[@]}" "origin/$BASE" pr/head
+ 
+   locked-tests:
+     name: A fix leaves its failing test alone
+@@ -329,9 +353,15 @@ jobs:
+               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+           }
+           load_gates || record_error "the signed AI-SDLC gate bundle is unavailable"
++          eval "$BUNDLE_GATE_SELECTOR"
+           run_locked() {
+             locked_base_arg=$(git rev-parse --verify "$2^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid base"; return 2; }
+             locked_head_arg=$(git rev-parse --verify "$3^{commit}") || { echo "LOCKED-TESTS RECORD ERROR: invalid head"; return 2; }
++            select_gate locked-tests python3 "$5"
++            if [ "${gate[1]}" = gate ]; then
++              "${gate[@]}" --base "$locked_base_arg" --head "$locked_head_arg" --test-paths "$test_paths"
++              return $?
++            fi
+             if [ -f "$4" ]; then
+               cp "$4" "$5" || { echo "LOCKED-TESTS RECORD ERROR: helper read failed"; return 2; }
+               locked_help=$(python3 "$5" --help 2>&1) || { printf '%s\n' "$locked_help"; echo "LOCKED-TESTS RECORD ERROR: helper interface failed"; return 2; }
+@@ -425,7 +455,9 @@ jobs:
+               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+           }
+           load_gates || { echo "::error::the signed AI-SDLC gate bundle is unavailable: see the lines above"; exit 2; }
+-          sh "$gates/scripts/secret_scan.sh" "origin/$BASE" pr/head
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate secret-scan sh "$gates/scripts/secret_scan.sh"
++          "${gate[@]}" "origin/$BASE" pr/head
+ 
+       - name: Written by is filled in
+         if: github.event_name == 'pull_request_target' || github.event_name == 'pull_request'
+@@ -443,14 +475,16 @@ jobs:
+           written_by_rc=0 written_by_output=
+           base_sha=$(git --no-replace-objects rev-parse --verify "origin/$BASE^{commit}") || written_by_rc=2
+           sha=$(git --no-replace-objects rev-parse --verify 'pr/head^{commit}') || written_by_rc=2
+-          [ -x "$bin/written-by" ] || written_by_rc=2
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate written-by "$bin/written-by"
++          [ -x "${gate[0]}" ] || written_by_rc=2
+           if [ "$written_by_rc" -eq 0 ]; then
+             printf '%s\n' "$BODY" > "$RUNNER_TEMP/pr-body.txt" \
+               && git --no-replace-objects -c core.quotePath=false diff --no-renames --name-only "$base_sha...$sha" > "$RUNNER_TEMP/pr-files.txt" \
+               || written_by_rc=2
+           fi
+           if [ "$written_by_rc" -eq 0 ]; then
+-            written_by_output=$("$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt" 2>&1) || written_by_rc=$?
++            written_by_output=$("${gate[@]}" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt" 2>&1) || written_by_rc=$?
+             # The native exit and last-line contract (ai-sdlc scripts/written_by_native.sh).
+             case "$written_by_rc:$(printf '%s\n' "$written_by_output" | tail -n 1)" in
+               '0:written-by: native'|'0:written-by: vendor'|'0:written-by: design'|'0:written-by: lane-failed'|'0:written-by: claude'|'0:written-by: docs only'|'0:written-by: operational data only'|'1:written-by: unknown'|2:*) ;;
+@@ -515,8 +549,10 @@ jobs:
+           case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+           case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+           bin=$gates/bin/$os-$arch
+-          [ -x "$bin/manifest-check" ] || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
+-          "$bin/manifest-check" "$RUNNER_TEMP/product.yaml"
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate manifest-check "$bin/manifest-check"
++          [ -x "${gate[0]}" ] || { echo "MANIFEST ERROR: trusted manifest bundle unavailable"; exit 2; }
++          "${gate[@]}" "$RUNNER_TEMP/product.yaml"
+ 
+   cloudflare-cost:
+     name: Cloudflare config stays inside the US$5 plan
+@@ -557,13 +593,15 @@ jobs:
+           case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
+           case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
+           bin=$gates/bin/$os-$arch
+-          [ -x "$bin/cf-cost-check" ] || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate cf-cost-check "$bin/cf-cost-check"
++          [ -x "${gate[0]}" ] || { echo "CF-COST: input error: trusted native bundle unavailable"; exit 2; }
+           # The base's owner decisions may allow a paid feature; the PR's own copy never counts.
+           set --
+           if git --no-replace-objects show "$base_sha:docs/owner-decisions.md" > "$RUNNER_TEMP/owner-decisions.md" 2>/dev/null; then
+             set -- --decisions "$RUNNER_TEMP/owner-decisions.md"
+           fi
+-          rc=0; "$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@" || rc=$?
++          rc=0; "${gate[@]}" --head "$sha" --base "$base_sha" "$@" || rc=$?
+           # The one documented fix for every finding (ai-sdlc #731): measure, set limits, rate-limit per IP.
+           [ "$rc" -ne 1 ] || echo "::error::How to fix: https://github.com/eugnel-ltd/ai-sdlc/blob/main/references/cloudflare.md#the-one-way-to-meet-the-limits-and-the-rate-limit"
+           exit "$rc"
+diff --git a/.github/workflows/nightly-gates.yml b/.github/workflows/nightly-gates.yml
+index d35cdb6..7f592ec 100644
+--- a/.github/workflows/nightly-gates.yml
++++ b/.github/workflows/nightly-gates.yml
+@@ -2,10 +2,10 @@
+ #
+ # Reusable workflow. A repo calls it from `.github/workflows/ai-sdlc-nightly.yml` on main, on
+ # schedule or workflow_dispatch, with `permissions: id-token: write` besides the write scopes below.
+-# The audit prompt (references/lessons-audit.md) and nightly_status.py come from the signed gate
++# The audit prompt (references/lessons-audit.md) and the audit/status gates come from the signed gate
+ # bundle; the caller's `.ai-sdlc/` is not read, and the caller cannot supply the command (#731
+ # section 6). The scheduled audit runs from a Claude cloud session; this is the manual run on the
+-# owner's Mac runner. claude runs through the bundle's scripts/claude_api.sh on the Anthropic API key
++# owner's Mac runner. claude runs through the bundle's claude-api gate (or its legacy script) on the API key
+ # in ~/.config/eugnel-runners/anthropic-api-key, never a subscription login (owner, 26 Oct 2026).
+ #
+ # Auth (slice 5): the audit step asks the broker for a one-hour eugnel-ai-sdlc-gates App token for
+@@ -31,6 +31,26 @@ permissions:
+   pull-requests: write
+   id-token: write
+ 
++# One selector shared by the gate steps; all paths are in the verified bundle.
++env:
++  BUNDLE_GATE_SELECTOR: |
++    # until step 8c: older signed bundles still need their original entry points.
++    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
++    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
++    aisdlc=$gates/bin/$os-$arch/aisdlc
++    if [ ! -x "$aisdlc" ] ||
++       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
++      aisdlc=
++    fi
++    select_gate() {
++      if [ -n "$aisdlc" ]; then
++        gate=( "$aisdlc" gate "$1" )
++      else
++        shift
++        gate=( "$@" )
++      fi
++    }
++
+ jobs:
+   audit:
+     name: Nightly lessons audit
+@@ -98,13 +118,18 @@ jobs:
+           git config user.name "ai-sdlc nightly audit"
+           git config user.email "ai-sdlc-nightly@users.noreply.github.com"
+           gates=$RUNNER_TEMP/ai-sdlc-gates
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate bookmark python3 "$gates/scripts/bookmark.py"
++          printf -v bookmark_command '%q ' "${gate[@]}"
++          bookmark_command=${bookmark_command% }
+           # The skill's files for this run are the verified bundle, not the runner's installed copy.
+-          prompt=$(printf 'Runtime note: the AI-SDLC skill files for this run are the signed gate bundle in %s. Wherever this prompt names ~/.claude/skills/ai-sdlc/, use %s/ instead.\n\n' "$gates" "$gates"; cat "$gates/references/lessons-audit.md")
++          prompt=$(printf 'Runtime note: the AI-SDLC skill files for this run are the signed gate bundle in %s. Wherever this prompt names ~/.claude/skills/ai-sdlc/, use %s/ instead. For bookmark operations use %s with the same arguments.\n\n' "$gates" "$gates" "$bookmark_command"; cat "$gates/references/lessons-audit.md")
+           # The runner's shell has errexit on, so the status is captured in a conditional; else a red
+           # audit ends the step here and its log tail never reaches the run log.
+           code=0
+-          sh "$gates/scripts/claude_api.sh" -p "$prompt" --permission-mode acceptEdits \
+-            --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash(python3 $gates/scripts/bookmark.py:*) Read Edit Write Grep Glob" \
++          select_gate claude-api sh "$gates/scripts/claude_api.sh"
++          "${gate[@]}" -p "$prompt" --permission-mode acceptEdits \
++            --allowedTools "Bash(git:*) Bash(gh:*) Bash(date:*) Bash($bookmark_command:*) Read Edit Write Grep Glob" \
+             > audit.log 2>&1 || code=$?
+           tail -c 20000 audit.log
+           echo "exit=$code"
+@@ -153,10 +178,12 @@ jobs:
+               && sh "$loader/load_gates.sh" "$RUNNER_TEMP/ai-sdlc-fetch" "$gates"
+           }
+           if load_gates; then
++            eval "$BUNDLE_GATE_SELECTOR"
++            select_gate nightly-status python3 -I "$gates/scripts/nightly_status.py"
+             if [ "$OUTCOME" != success ]; then
+-              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" red --runner "workflow run #$RUN_NUMBER" --cause "the audit step failed: $RUN_URL"
++              "${gate[@]}" --repo "$GITHUB_REPOSITORY" red --runner "workflow run #$RUN_NUMBER" --cause "the audit step failed: $RUN_URL"
+             else
+-              python3 -I "$gates/scripts/nightly_status.py" --repo "$GITHUB_REPOSITORY" green --result "Workflow run #$RUN_NUMBER passed: $RUN_URL"
++              "${gate[@]}" --repo "$GITHUB_REPOSITORY" green --result "Workflow run #$RUN_NUMBER passed: $RUN_URL"
+             fi
+             exit $?
+           fi
+diff --git a/.github/workflows/security.yml b/.github/workflows/security.yml
+index 8491f3d..18b409d 100644
+--- a/.github/workflows/security.yml
++++ b/.github/workflows/security.yml
+@@ -40,6 +40,26 @@ concurrency:
+   group: ai-sdlc-security-${{ github.repository }}
+   cancel-in-progress: false
+ 
++# One selector shared by the gate steps; all paths are in the verified bundle.
++env:
++  BUNDLE_GATE_SELECTOR: |
++    # until step 8c: older signed bundles still need their original entry points.
++    case "$(uname -s)" in Linux) os=linux ;; Darwin) os=darwin ;; *) os=unknown ;; esac
++    case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) arch=unknown ;; esac
++    aisdlc=$gates/bin/$os-$arch/aisdlc
++    if [ ! -x "$aisdlc" ] ||
++       [ "$("$aisdlc" gate 2>&1 | sed -n '1p')" != 'usage: aisdlc gate <name> [args]' ]; then
++      aisdlc=
++    fi
++    select_gate() {
++      if [ -n "$aisdlc" ]; then
++        gate=( "$aisdlc" gate "$1" )
++      else
++        shift
++        gate=( "$@" )
++      fi
++    }
++
+ jobs:
+   scan:
+     name: Secrets, dependencies and static analysis
+@@ -125,5 +145,8 @@ jobs:
+             --description "Found by the weekly AI-SDLC security scan" --force
+           for l in intent security; do gh label create "$l" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true; done
+           out=$RUNNER_TEMP/sec
+-          python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py" --repo "$GITHUB_REPOSITORY" --root . \
++          gates=$RUNNER_TEMP/ai-sdlc-gates
++          eval "$BUNDLE_GATE_SELECTOR"
++          select_gate security-intake python3 -I "$gates/scripts/security_intake.py"
++          "${gate[@]}" --repo "$GITHUB_REPOSITORY" --root . \
+             --gitleaks "$out/gitleaks.json" --osv "$out/osv.json" --semgrep "$out/semgrep.json" --file
+diff --git a/README.md b/README.md
+index 94a422f..fc37740 100644
+--- a/README.md
++++ b/README.md
+@@ -10,16 +10,20 @@ The broker serves only repos owned by eugnel-ltd or fol2. It does no signature w
+ 
+ | File | What it does |
+ |---|---|
+-| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again and run their scripts from the bundle. The written-by, manifest and Cloudflare-cost gates run the archive's prebuilt binaries (`bin/<os>-<arch>/`). No gate reads the caller's `.ai-sdlc/`. |
+-| `.github/workflows/security.yml` | The weekly security scan. `security_intake.py` comes from the signed bundle. |
+-| `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and `nightly_status.py` come from the signed bundle; the caller cannot supply the command. |
+-| `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `bot_review.sh` (slice 5). |
++| `.github/workflows/checks.yml` | The PR checks. The first job fetches the signed record and bundle once and keeps them as a run artifact. `review-on-head`, `owner-decisions`, `locked-tests` and `secret-scan` verify that pair again. These and the written-by, manifest and Cloudflare-cost gates prefer `bin/<os>-<arch>/aisdlc gate <name>` from that bundle. No gate reads the caller's `.ai-sdlc/`. |
++| `.github/workflows/security.yml` | The weekly security scan. Runs the signed bundle's `aisdlc gate security-intake`. |
++| `.github/workflows/nightly-gates.yml` | The manual nightly lessons audit on the Mac runner. The prompt and the `claude-api`, `bookmark` and `nightly-status` gates come from the signed bundle; the caller cannot supply the command. |
++| `.github/workflows/bot-review.yml` | The App's formal review of each open PR head, from the bundle's `aisdlc gate bot-review`. |
+ | `.github/workflows/tag-sync.yml` | Moves `v3` only to the newest loader commit in a verified signed record (contract G). It runs every 15 minutes, so the tag can lag the record by one schedule interval (15 minutes). The transition window covers this lag. A delayed or failed run can extend the lag. |
+ | `.github/workflows/ai-sdlc-checks.yml` | This repo's own PR gate. It calls `checks.yml` at `main`. |
+ | `fetch_gates.py` | Verifies the record, chooses the served bundle, checks the archive and unpacks it. `fetch` is the run's one broker call; `unpack` checks the saved pair again in a later job, then checks every unpacked file against `MANIFEST.sha256`. |
+ | `load_gates.sh` | Runs `unpack` with this loader commit's pinned verifier. |
+ | `verifier/` | A byte copy of ai-sdlc `gates/verifier/` (contract C). Change both together in reviewed PRs. |
+ 
++Each of the four gate workflows has one shared `select_gate` shell function. It uses the bundle's executable `bin/<os>-<arch>/aisdlc` only when that gate's help or harmless usage path identifies it. Until step 8c, a missing binary or gate selects the original bundle script (with its original interpreter and flags) or native tool. A gate failure is returned unchanged; it never triggers a second attempt through the fallback. The nightly bookmark command is selected in both the prompt and `--allowedTools`.
++
++Locked-tests runs the verified bundle binary, when available, against the pinned PR target and head. Its fallback still copies the bundle's Python helper to `$RUNNER_TEMP` before running it; PR code supplies neither helper. The written-by exit/output contract and the owner's warning-only treatment of an unknown author are unchanged.
++
+ ## Which bundle a call gets
+ 
+ - `checks.yml@<40-hex sha>`: only the canary may call at the record's `candidate.loader_sha`. It gets the candidate bundle.
+diff --git a/docs/plans/483-loader-step-8b-report.md b/docs/plans/483-loader-step-8b-report.md
+new file mode 100644
+index 0000000..2311aff
+--- /dev/null
++++ b/docs/plans/483-loader-step-8b-report.md
+@@ -0,0 +1,49 @@
++Implemented step 8b using the gate names in ai-sdlc's `gate_commands.go` and its gate implementations. One shared `select_gate` function per workflow selects a Bash command array; no Go implementation or policy is duplicated in the loader.
++
++Below, `A` means `"$gates/bin/$os-$arch/aisdlc" gate`. Old paths are relative to the verified bundle; argument suffixes shown after the new gate name remain unchanged for the old entry point too.
++
++| Workflow / step | Before | After |
++|---|---|---|
++| checks / review-on-head | `sh scripts/review_on_head.sh` | `A review-on-head "$PR" "$HEAD" --repo "$GITHUB_REPOSITORY"` |
++| checks / owner-decisions | `sh scripts/owner_decisions_check.sh` | `A owner-decisions "origin/$BASE" pr/head` |
++| checks / locked-tests | Copy `scripts/locked_tests_check.py` to `$RUNNER_TEMP`, run with Python | `A locked-tests --base "$locked_base_arg" --head "$locked_head_arg" --test-paths "$test_paths"` |
++| checks / secret-scan | `sh scripts/secret_scan.sh` | `A secret-scan "origin/$BASE" pr/head` |
++| checks / written-by | `bin/<target>/written-by` | `A written-by --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"` |
++| checks / manifest | `bin/<target>/manifest-check` | `A manifest-check "$RUNNER_TEMP/product.yaml"` |
++| checks / Cloudflare cost | `bin/<target>/cf-cost-check` | `A cf-cost-check --head "$sha" --base "$base_sha" "$@"` (trusted base decisions) |
++| bot-review / review | `sh scripts/bot_review.sh` | `A bot-review --repo "$GITHUB_REPOSITORY"` |
++| nightly / audit | `sh scripts/claude_api.sh` | `A claude-api -p "$prompt" --permission-mode acceptEdits --allowedTools ...` |
++| nightly / bookmark permission | `python3 scripts/bookmark.py` | `A bookmark`, in both the prompt and `--allowedTools`, with the same bookmark arguments |
++| nightly / tracking | `python3 -I scripts/nightly_status.py` | `A nightly-status --repo "$GITHUB_REPOSITORY"`, then unchanged `red --runner ... --cause ...` or `green --result ...` |
++| security / digest | `python3 -I scripts/security_intake.py` | `A security-intake --repo "$GITHUB_REPOSITORY" --root . --gitleaks "$out/gitleaks.json" --osv "$out/osv.json" --semgrep "$out/semgrep.json" --file` |
++
++The fallback, marked `# until step 8c`, retains every original entry point and interpreter flag. Each workflow has one selector block. When loaded, it sets `aisdlc=$gates/bin/$os-$arch/aisdlc` and checks that the binary is executable and the first line of `"$aisdlc" gate 2>&1` is exactly `usage: aisdlc gate <name> [args]`. The expected usage exit of 2 is accepted, including under Bash's `errexit` and `pipefail`. ai-sdlc #961 introduced the command and all twelve gate names together, so this single bundle probe is reused by every subsequent selection in the step. Missing/non-executable binaries and any other first line select the original path. Detection uses POSIX shell syntax; the existing Bash command-array interface preserves arguments. No per-gate help, HOME override, API-key diagnostic or Claude invocation is needed. A gate failure never retries through the fallback.
++
++Locked-tests still resolves the independently pinned target/head and uses only the signed bundle. Its complete copied-Python and older-interface fallbacks remain. Written-by retains its native exit/last-line contract and the owner's warning-only treatment of an unknown author. No gate decision, secret, permission, runner, trigger, concurrency setting, bundle fetch or verification changed. The only visible changes are command routing and the nightly prompt/allow-list naming the selected bookmark command.
++
++No files or launchers were deleted. This loader has no Go package to redesign; its existing Python test runner remains.
++
++| Old suite | Parity outcome |
++|---|---|
++| `test_checks_workflow.py` | All assertions retained or updated to assert selected commands and their original arguments; every written-by case now runs through both binary layouts. |
++| `test_fetch_gates.py` | Unchanged; all signature, routing, archive and manifest assertions pass. |
++| `test_load_gates.py` | Unchanged; repeated verifier setup still passes. |
++
++`test_bundle_gate.py` covers all 12 gates across eleven availability/usage states and exits 0/1/2, exact argument preservation, trusted locked-tests execution, and nightly bookmark prompt/allow-list agreement. It accepts the exact first usage line on stdout or stderr, including exit 2 and subsequent detail lines; it rejects missing, non-executable, unknown, failed and empty binaries, a usage line after a diagnostic, and usage lines with a prefix or suffix. Repeated gate selections assert exactly one bundle probe. `test_checks_workflow.py` uses the same usage-line fixture; its written-by contracts and all unrelated assertions remain. Nothing is skipped or weakened.
++
++Selector follow-up validation (3 November 2026):
++
++- `python3 -m unittest discover -v -s tests`, the command in `test.yml`: all 56 tests passed, including 396 gate/state/exit combinations. `PYTHONDONTWRITEBYTECODE=1`, `BASH_ENV=/dev/null`, and temporary fixtures stayed inside this worktree. To honor the no-commit instruction, a temporary local Git wrapper replaced only the existing loader test's fixture-commit setup with an import of this repository's existing HEAD; no commit command or signing ran, and the test and its assertions were unchanged.
++- PyYAML parsed all seven workflows. Comparison with HEAD confirmed that only the four selector blocks changed structurally; all other workflow configuration and steps are identical.
++- `bash -n` passed for all four selectors; `sh -n` passed for their POSIX probe blocks. `git diff --check` passed. Actionlint is not installed.
++
++Initial step 8b validation (before the selector follow-up):
++
++- `python3 -m unittest discover -v -s tests`, exactly as `test.yml`: baseline 52 passed; final 56 passed. CPU user+system: 0.399 s before, 3.615 s after. `PYTHONDONTWRITEBYTECODE=1`; fixture signing disabled and `BASH_ENV=/dev/null` isolate host configuration.
++- PyYAML loaded all seven workflows. Structural comparison against HEAD confirmed unchanged workflow metadata and fetch/verification steps. `git diff --check` passed. Actionlint is not installed.
++- A clean disposable worktree of available ai-sdlc `origin/main` (`efa25faf2e1a5589f613b80bc52ae3820da5e7c8`, #961) passed `sh scripts/aisdlc_build.sh`. Its `.ai-sdlc/bin/aisdlc` selected all 12 gates through the actual selector. Every table command was exercised with harmless inputs or help: fixture checks exited 0; review/bot/Claude/nightly usage paths exited 2; bookmark's missing-file default-window path exited 3; security help exited 0. Claude used an unreadable home; no paid call ran.
++- In that checkout's `tools/aisdlc`: `gofmt -l .` printed nothing; `go vet ./...` and `go test -count=1 ./...` passed. Full Go test CPU: 46.877 s. CI's `CGO_ENABLED=1 go test -race -trimpath -count=1` passed for `./internal/quota-report ./internal/ci-runner/... ./internal/merge ./internal/ci/... ./internal/proc ./internal/gh ./internal/platform/... ./internal/lane/... ./internal/review/...`; CPU: 45.221 s. The initial Go runs lacked CI's subscriptions prerequisite; `sh tools/subscriptions-due/check-build.sh` prepared it from a copied offline cache, and both complete runs then passed. Go 1.27.2, `GOTOOLCHAIN=local`, `GOPROXY=off`; all caches outside this worktree.
++
++Proof limitation: `git -C /home/user/ai-sdlc fetch -q origin main` failed because its Git metadata is read-only. A disposable clone's network fetch also failed because the configured proxy was unavailable. The build therefore proves the available #961 snapshot, not a freshly fetched main. The disposable worktree, clone, fixtures, logs and caches were removed.
++
++Follow-up changed files: `.github/workflows/{checks,bot-review,nightly-gates,security}.yml`, `tests/test_checks_workflow.py`, `tests/test_bundle_gate.py`, and this report. `README.md` was changed only in the already committed initial step. No commit or publication was made during this follow-up; autonomy ledgers, Owner settings and spend gates were untouched.
+diff --git a/tests/test_bundle_gate.py b/tests/test_bundle_gate.py
+new file mode 100644
+index 0000000..1aad749
+--- /dev/null
++++ b/tests/test_bundle_gate.py
+@@ -0,0 +1,195 @@
++"""Run the workflows' reader-first selector without GitHub or a bundle download."""
++
++from itertools import product
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import textwrap
++import unittest
++
++
++ROOT = Path(__file__).resolve().parents[1]
++WORKFLOWS = ("checks", "bot-review", "nightly-gates", "security")
++GATES = ("review-on-head", "owner-decisions", "locked-tests", "secret-scan",
++         "written-by", "manifest-check", "cf-cost-check", "bot-review",
++         "claude-api", "bookmark", "nightly-status", "security-intake")
++
++
++def workflow(name):
++    return (ROOT / ".github/workflows" / f"{name}.yml").read_text()
++
++
++def selector(text):
++    return textwrap.dedent(text.split("  BUNDLE_GATE_SELECTOR: |\n", 1)[1].split("\njobs:\n", 1)[0])
++
++
++def step(text, name):
++    block = text.split(f"      - name: {name}\n", 1)[1].split("        run: |\n", 1)[1]
++    lines = []
++    for line in block.splitlines():
++        if line.strip() and not line.startswith("          "):
++            break
++        lines.append(line)
++    return textwrap.dedent("\n".join(lines))
++
++
++def executable(path, body):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text("#!/bin/sh\n" + body)
++    path.chmod(0o755)
++
++
++class BundleGate(unittest.TestCase):
++    def test_each_workflow_has_one_shared_selector(self):
++        expected = selector(workflow("checks"))
++        for name in WORKFLOWS:
++            text = workflow(name)
++            self.assertEqual(text.count("select_gate() {"), 1, name)
++            self.assertEqual(selector(text), expected, name)
++            self.assertIn("# until step 8c", expected)
++
++    def test_selection_arguments_and_exit_codes(self):
++        # Every gate: availability and the exact first line of `aisdlc gate`.
++        # Usage exits 2; a real gate failure never retries through the old path.
++        states = ("missing", "not-executable", "unknown", "failed", "usage-zero", "usage-two",
++                  "usage-stderr", "usage-later", "usage-prefix", "usage-suffix", "empty")
++        for name, state, rc in product(GATES, states, (0, 1, 2)):
++            with self.subTest(name=name, state=state, rc=rc), tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                gates = root / "signed bundle"
++                stubs = root / "stubs"
++                executable(stubs / "uname", 'case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n')
++                binary = gates / "bin/darwin-arm64/aisdlc"
++                if state != "missing":
++                    executable(binary, '''if [ "$#" -eq 1 ] && [ "$1" = gate ]; then
++  echo probe >> "$PROBES"
++  case "$PROBE_STATE" in
++    unknown) echo 'unknown gate: fixture (usage: aisdlc gate <name>)'; exit 2 ;;
++    failed) echo 'cannot start fixture'; exit 126 ;;
++    usage-later) echo 'diagnostic first' ;;
++    usage-prefix) echo 'prefix usage: aisdlc gate <name> [args]'; exit 2 ;;
++    usage-suffix) echo 'usage: aisdlc gate <name> [args] suffix'; exit 2 ;;
++    empty) exit 2 ;;
++    usage-stderr) exec 1>&2 ;;
++  esac
++  echo 'usage: aisdlc gate <name> [args]'
++  echo 'additional usage details'
++  [ "$PROBE_STATE" = usage-zero ] && exit 0
++  exit 2
++fi
++printf '%s\\0' "$@" > "$CALLS"
++echo binary
++exit "$GATE_RC"
++''')
++                    if state == "not-executable":
++                        binary.chmod(0o644)
++                legacy = gates / "scripts/original.sh"
++                executable(legacy, 'printf "%s\\0" "$@" > "$CALLS"\necho legacy\nexit "$GATE_RC"\n')
++                env = {**os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
++                       "gates": str(gates), "LEGACY": str(legacy), "NAME": name,
++                       "PROBE_STATE": state, "GATE_RC": str(rc), "CALLS": str(root / "calls"),
++                       "PROBES": str(root / "probes")}
++                args = ["space and\nnewline", "--flag", "*.py", ""]
++                result = subprocess.run(
++                    ["bash", "-euo", "pipefail", "-c", selector(workflow("checks")) +
++                     '\nselect_gate bookmark sh "$LEGACY"\n'
++                     'select_gate "$NAME" sh "$LEGACY"\n"${gate[@]}" "$@"', "fixture", *args],
++                    env=env, capture_output=True, text=True, timeout=5)
++                modern = state in ("usage-zero", "usage-two", "usage-stderr")
++                self.assertEqual(result.returncode, rc, result.stderr)
++                self.assertEqual(result.stdout, "binary\n" if modern else "legacy\n")
++                self.assertEqual(result.stderr, "")
++                expected = (["gate", name] if modern else []) + args
++                self.assertEqual((root / "calls").read_bytes(), b"".join(x.encode() + b"\0" for x in expected))
++                if state in ("missing", "not-executable"):
++                    self.assertFalse((root / "probes").exists())
++                else:
++                    self.assertEqual((root / "probes").read_text(), "probe\n")
++
++    def test_locked_tests_only_runs_the_trusted_bundle_helper(self):
++        text = workflow("checks")
++        run_locked = text.split("          run_locked() {\n", 1)[1].split('\n          run_locked "$trusted"', 1)[0]
++        script = "run_locked() {\n" + textwrap.dedent(run_locked)
++        for modern, rc in product((False, True), (0, 1, 2)):
++            with self.subTest(modern=modern, rc=rc), tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                gates = root / "bundle"
++                stubs = root / "stubs"
++                executable(stubs / "uname", 'case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac\n')
++                executable(stubs / "git", 'printf "%s\\n" "$3"\n')
++                if modern:
++                    executable(gates / "bin/linux-amd64/aisdlc", '''if [ "$#" -eq 1 ] && [ "$1" = gate ]; then
++  echo 'usage: aisdlc gate <name> [args]'; exit 2
++fi
++printf '%s\\n' "$0" "$@"
++exit "$GATE_RC"
++''')
++                helper = gates / "scripts/locked_tests_check.py"
++                helper.parent.mkdir(parents=True, exist_ok=True)
++                helper.write_text('import os, sys\n'
++                                  'if "--help" in sys.argv:\n'
++                                  '    print("usage: locked_tests_check.py --base BASE")\n'
++                                  '    sys.exit(0)\n'
++                                  'print(__file__)\nprint("\\n".join(sys.argv[1:]))\n'
++                                  'sys.exit(int(os.environ["GATE_RC"]))\n')
++                # Neither a helper nor a binary in the PR's working tree may run.
++                executable(root / "scripts/locked_tests_check.py", "echo PR-code-ran; exit 99\n")
++                executable(root / "bin/linux-amd64/aisdlc", "echo PR-code-ran; exit 99\n")
++                copied = root / "trusted-locked.py"
++                env = {**os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
++                       "gates": str(gates), "GATE_RC": str(rc)}
++                command = (selector(text) + "\ntest_paths='tests/ :(glob)**/*_test.go'\n" + script +
++                           '\nrun_locked trusted pinned-base pinned-head "$1" "$2"')
++                result = subprocess.run(["bash", "-eu", "-c", command, "fixture", str(helper), str(copied)],
++                                        cwd=root, env=env, capture_output=True, text=True, timeout=5)
++                self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
++                self.assertEqual(result.stderr, "")
++                self.assertNotIn("PR-code-ran", result.stdout)
++                source = gates / "bin/linux-amd64/aisdlc" if modern else copied
++                expected = [str(source)] + (["gate", "locked-tests"] if modern else [])
++                expected += ["--base", "pinned-base^{commit}", "--head", "pinned-head^{commit}",
++                             "--test-paths", "tests/ :(glob)**/*_test.go"]
++                self.assertEqual(result.stdout.splitlines(), expected)
++                self.assertEqual(copied.exists(), not modern)
++
++    def test_bookmark_selection_matches_the_prompt_and_allowed_tools(self):
++        text = workflow("nightly-gates")
++        audit = step(text, "Run the audit")
++        # Run the actual selection/prompt lines and audit command, bypassing only
++        # the earlier authentication and git setup, which this change does not alter.
++        audit = audit[audit.index("gates=$RUNNER_TEMP/ai-sdlc-gates"):]
++        for modern in (False, True):
++            with self.subTest(modern=modern), tempfile.TemporaryDirectory() as directory:
++                root = Path(directory)
++                gates = root / "ai-sdlc-gates"
++                stubs = root / "stubs"
++                executable(stubs / "uname", 'case "$1" in -s) echo Darwin ;; -m) echo x86_64 ;; esac\n')
++                record = 'printf "%s\\0" "$@" > "$CALLS"\nexit 1\n'
++                executable(gates / "scripts/claude_api.sh", record)
++                if modern:
++                    executable(gates / "bin/darwin-amd64/aisdlc", '''if [ "$#" -eq 1 ] && [ "$1" = gate ]; then
++  echo 'usage: aisdlc gate <name> [args]'
++  exit 2
++fi
++''' + record)
++                reference = gates / "references/lessons-audit.md"
++                reference.parent.mkdir(parents=True)
++                reference.write_text("Audit fixture.\n")
++                env = {**os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
++                       "RUNNER_TEMP": str(root), "BUNDLE_GATE_SELECTOR": selector(text),
++                       "CALLS": str(root / "calls")}
++                result = subprocess.run(["bash", "-eu", "-c", audit], cwd=root, env=env,
++                                        capture_output=True, text=True, timeout=5)
++                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
++                self.assertEqual(result.stderr, "")
++                args = (root / "calls").read_bytes().decode().split("\0")[:-1]
++                if modern:
++                    self.assertEqual(args[:2], ["gate", "claude-api"])
++                bookmark = (f"{gates}/bin/darwin-amd64/aisdlc gate bookmark" if modern else
++                            f"python3 {gates}/scripts/bookmark.py")
++                self.assertIn(f"For bookmark operations use {bookmark} with the same arguments.", args[args.index("-p") + 1])
++                self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
++                self.assertEqual(args[args.index("--allowedTools") + 1],
++                                 f"Bash(git:*) Bash(gh:*) Bash(date:*) Bash({bookmark}:*) Read Edit Write Grep Glob")
++                self.assertIn("exit=1", result.stdout)
+diff --git a/tests/test_checks_workflow.py b/tests/test_checks_workflow.py
+index 01f48da..f538644 100644
+--- a/tests/test_checks_workflow.py
++++ b/tests/test_checks_workflow.py
+@@ -1,5 +1,6 @@
+ """Text and shell checks for .github/workflows/checks.yml (no YAML reader needed)."""
+ 
++from itertools import product
+ import os
+ from pathlib import Path
+ import subprocess
+@@ -7,6 +8,8 @@ import tempfile
+ import textwrap
+ import unittest
+ 
++from test_bundle_gate import selector
++
+ ROOT = Path(__file__).resolve().parents[1]
+ WORKFLOW = (ROOT / ".github/workflows/checks.yml").read_text()
+ 
+@@ -50,9 +53,11 @@ class ChecksWorkflow(unittest.TestCase):
+ 
+     def test_native_gates_run_the_archive_binaries(self):
+         # Slice 3: no gate reads the caller's copies or builds anything.
+-        for call in ('"$bin/written-by" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"',
+-                     '"$bin/manifest-check" "$RUNNER_TEMP/product.yaml"',
+-                     '"$bin/cf-cost-check" --head "$sha" --base "$base_sha" "$@"'):
++        for name in ("written-by", "manifest-check", "cf-cost-check"):
++            self.assertIn(f'select_gate {name} "$bin/{name}"', WORKFLOW)
++        for call in ('"${gate[@]}" --body-file "$RUNNER_TEMP/pr-body.txt" --files "$RUNNER_TEMP/pr-files.txt"',
++                     '"${gate[@]}" "$RUNNER_TEMP/product.yaml"',
++                     '"${gate[@]}" --head "$sha" --base "$base_sha" "$@"'):
+             self.assertIn(call, WORKFLOW)
+         self.assertNotIn("$SCRIPTS", WORKFLOW)
+         self.assertNotIn("setup-go", WORKFLOW)
+@@ -76,8 +81,8 @@ class ChecksWorkflow(unittest.TestCase):
+             (2, "", 2, "written-by: not checked (native setup failure)"),
+             (1, "written-by: vendor", 2, "::error::written-by native result violates exit/output contract"),
+         )
+-        for rc, output, expected_rc, last_line in cases:
+-            with self.subTest(rc=rc, output=output), tempfile.TemporaryDirectory(dir=ROOT) as directory:
++        for modern, (rc, output, expected_rc, last_line) in product((False, True), cases):
++            with self.subTest(modern=modern, rc=rc, output=output), tempfile.TemporaryDirectory() as directory:
+                 work = Path(directory)
+                 stubs = work / "stubs"
+                 stubs.mkdir()
+@@ -92,15 +97,19 @@ class ChecksWorkflow(unittest.TestCase):
+                 os_name = os.uname().sysname.lower()
+                 arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(
+                     os.uname().machine, "unknown")
+-                binary = work / "ai-sdlc-gates" / "bin" / f"{os_name}-{arch}" / "written-by"
++                binary = work / "ai-sdlc-gates" / "bin" / f"{os_name}-{arch}" / ("aisdlc" if modern else "written-by")
+                 binary.parent.mkdir(parents=True)
+-                binary.write_text('#!/bin/sh\nprintf \'%s\\n\' "$STUB_OUTPUT"\nexit "$STUB_RC"\n')
++                binary.write_text('#!/bin/sh\n'
++                                  'if [ "$#" -eq 1 ] && [ "$1" = gate ]; then\n'
++                                  '  echo "usage: aisdlc gate <name> [args]"; exit 2\nfi\n'
++                                  'printf \'%s\\n\' "$STUB_OUTPUT"\nexit "$STUB_RC"\n')
+                 binary.chmod(0o755)
+                 summary = work / "summary"
+-                env = {**os.environ, "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
++                env = {**os.environ, "BASH_ENV": "/dev/null", "PATH": str(stubs) + os.pathsep + os.environ["PATH"],
+                        "RUNNER_TEMP": str(work), "GITHUB_STEP_SUMMARY": str(summary),
+-                       "BASE": "main", "BODY": "Written by: cursor", "STUB_RC": str(rc), "STUB_OUTPUT": output}
+-                result = subprocess.run(["sh", "-e", "-c", script], cwd=work, env=env,
++                       "BASE": "main", "BODY": "Written by: cursor", "STUB_RC": str(rc), "STUB_OUTPUT": output,
++                       "BUNDLE_GATE_SELECTOR": selector(WORKFLOW)}
++                result = subprocess.run(["bash", "-e", "-c", script], cwd=work, env=env,
+                                         capture_output=True, text=True, timeout=10)
+                 self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+                 self.assertEqual(result.stderr, "")
+@@ -127,7 +136,8 @@ class SecurityAndNightly(unittest.TestCase):
+     NIGHTLY = (ROOT / ".github/workflows/nightly-gates.yml").read_text()
+ 
+     def test_scripts_come_from_the_signed_bundle(self):
+-        self.assertIn('python3 -I "$RUNNER_TEMP/ai-sdlc-gates/scripts/security_intake.py"', self.SECURITY)
++        self.assertIn('select_gate security-intake python3 -I "$gates/scripts/security_intake.py"', self.SECURITY)
++        self.assertIn('"${gate[@]}" --repo "$GITHUB_REPOSITORY" --root .', self.SECURITY)
+         self.assertIn('fetch_gates.py" bundle', self.SECURITY)
+         self.assertIn('"$gates/scripts/nightly_status.py"', self.NIGHTLY)
+         self.assertIn('cat "$gates/references/lessons-audit.md"', self.NIGHTLY)
+@@ -149,7 +159,8 @@ class SecurityAndNightly(unittest.TestCase):
+ 
+     def test_the_audit_runs_claude_on_the_runner_api_key_only(self):
+         # Owner, 26 Oct 2026: "On local you can use api". No bare claude call may use a login.
+-        self.assertIn('sh "$gates/scripts/claude_api.sh" -p "$prompt"', self.NIGHTLY)
++        self.assertIn('select_gate claude-api sh "$gates/scripts/claude_api.sh"', self.NIGHTLY)
++        self.assertIn('"${gate[@]}" -p "$prompt"', self.NIGHTLY)
+         self.assertNotIn("\n          claude -p", self.NIGHTLY)
+ 
+     def test_the_caller_cannot_supply_the_audit_command(self):
+-- 
+2.43.0
+
